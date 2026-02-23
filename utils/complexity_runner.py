@@ -184,6 +184,46 @@ class ComplexityAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
         self._loop_depth -= 1
 
+    # ── comprehensions & generator expressions ────────────────
+    # These are separate AST nodes (not For), so they need
+    # their own visitors. Each generator clause acts like a loop.
+
+    def _process_comprehension(self, generators: list, ds_kind: str | None):
+        """
+        Shared logic for ListComp, SetComp, DictComp, GeneratorExp.
+        Each 'generator' clause (for x in iterable) is one loop level.
+        """
+        depth = 0
+        for gen in generators:
+            const_desc = self._is_constant_iter(gen.iter)
+            if const_desc:
+                self.constant_loops.append(f"{ds_kind or 'genexpr'}:{const_desc}")
+            else:
+                depth += 1
+        if depth > 0:
+            self._loop_depth += depth
+            self.max_loop_depth = max(self.max_loop_depth, self._loop_depth)
+            if ds_kind:
+                self._ds_used.append(ds_kind)   # O(n) space for materialised types
+            self._loop_depth -= depth
+
+    def visit_ListComp(self, node):
+        self._process_comprehension(node.generators, "list")
+        self.generic_visit(node)
+
+    def visit_SetComp(self, node):
+        self._process_comprehension(node.generators, "set")
+        self.generic_visit(node)
+
+    def visit_DictComp(self, node):
+        self._process_comprehension(node.generators, "dict")
+        self.generic_visit(node)
+
+    def visit_GeneratorExp(self, node):
+        # Generator expressions are lazy — no O(n) space allocation
+        self._process_comprehension(node.generators, None)
+        self.generic_visit(node)
+
     # ── data-structure literals ───────────────────────────────
 
     def visit_List(self, node):
