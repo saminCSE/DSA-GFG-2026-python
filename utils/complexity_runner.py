@@ -50,6 +50,14 @@ class ComplexityAnalyzer(ast.NodeVisitor):
         self._ds_used          = []      # dynamic data-structure literals
         self.constant_loops    = []      # e.g. ["range(1, 11)"] – fixed-size loops
         self.constant_recursion = False  # True when recursion depth is bounded by a constant
+        self.has_binary_search  = False  # kept for backward compat
+        self.has_log_loop       = False  # True when while-loop shrinks by division/shift
+        self._log_divisor       = 2      # the divisor detected (2, 10, …)
+        self.has_log_recursion  = False  # True when recursive call passes n//k or n>>k
+        self._log_rec_divisor   = 2      # divisor in the recursive argument
+        self.has_str_loop       = False  # True when loop iterates over str(variable)
+        self.has_str_conv       = False  # True when str(variable) is called standalone (no loop)
+        self.has_implicit_iter  = False  # True when built-in/method iterates (sum, max, .reverse, .join …)
 
     # ── collect function definitions + true self-recursion ─────
 
@@ -104,6 +112,23 @@ class ComplexityAnalyzer(ast.NodeVisitor):
 
         return found_base
 
+    @staticmethod
+    def _is_log_arg(call_node: ast.Call) -> int | None:
+        """
+        If any argument of the recursive call is of the form
+            n // k   (BinOp FloorDiv)
+            n >> k   (BinOp RShift)
+        return the divisor k (int), otherwise None.
+        """
+        for arg in call_node.args:
+            if isinstance(arg, ast.BinOp) and isinstance(
+                    arg.op, (ast.FloorDiv, ast.RShift)):
+                if isinstance(arg.right, ast.Constant) and arg.right.value > 1:
+                    divisor = int(arg.right.value)
+                    # >> k means divide by 2^k, treat as base-2
+                    return 2 if isinstance(arg.op, ast.RShift) else divisor
+        return None
+
     def visit_FunctionDef(self, node):
         self._fn_names.add(node.name)
         # True recursion = function calls itself inside its own body
@@ -114,9 +139,14 @@ class ComplexityAnalyzer(ast.NodeVisitor):
                     and child.func.id == node.name
                 ):
                     self.has_recursion = True
-                    # Check if the depth is bounded by a constant
+                    # Constant-bounded recursion (counter param)
                     if self._has_constant_base_case(node):
                         self.constant_recursion = True
+                    # Logarithmic recursion: recursive call passes n//k or n>>k
+                    divisor = self._is_log_arg(child)
+                    if divisor is not None:
+                        self.has_log_recursion = True
+                        self._log_rec_divisor  = divisor
                     break
         self.generic_visit(node)
 
@@ -130,9 +160,30 @@ class ComplexityAnalyzer(ast.NodeVisitor):
             self._called.add(name)
             if name == "sorted":
                 self.has_sort = True
+            # str(variable) → creates a string of O(log₁₀n) characters
+            if (name == "str" and node.args
+                    and not all(isinstance(a, ast.Constant) for a in node.args)):
+                self.has_str_conv = True
+            # Built-in functions that iterate over all elements
+            if name in ("sum", "max", "min", "any", "all"):
+                if node.args:
+                    arg = node.args[0]
+                    if not (isinstance(arg, ast.Constant)
+                            or self._is_constant_iter(arg)):
+                        self.has_implicit_iter = True
+            # Constructor calls that allocate + iterate
+            if name in ("list", "tuple"):
+                if node.args and not all(
+                        isinstance(a, ast.Constant) for a in node.args):
+                    self.has_implicit_iter = True
         elif isinstance(node.func, ast.Attribute):
-            if node.func.attr in ("sort", "sorted"):
+            attr = node.func.attr
+            if attr in ("sort", "sorted"):
                 self.has_sort = True
+            # Methods that iterate over the collection
+            if attr in ("reverse", "join", "split", "count",
+                        "index", "find", "replace"):
+                self.has_implicit_iter = True
         self.generic_visit(node)
 
     # ── for-loops ─────────────────────────────────────────────
@@ -157,6 +208,22 @@ class ComplexityAnalyzer(ast.NodeVisitor):
             return f"range({args_str})"
         return None
 
+    @staticmethod
+    def _is_str_iter(iter_node) -> bool:
+        """
+        Returns True when iter_node is  str(variable)  — i.e. iterating over
+        the decimal digits of a number.  The loop runs O(log₁₀n) times, not n.
+        e.g.  for ch in str(n)   → True
+              for ch in str(42)  → False (constant)
+        """
+        return (
+            isinstance(iter_node, ast.Call)
+            and isinstance(iter_node.func, ast.Name)
+            and iter_node.func.id == "str"
+            and bool(iter_node.args)
+            and not all(isinstance(a, ast.Constant) for a in iter_node.args)
+        )
+
     def visit_For(self, node):
         const_desc = self._is_constant_iter(node.iter)
         if const_desc:
@@ -164,22 +231,51 @@ class ComplexityAnalyzer(ast.NodeVisitor):
             self.constant_loops.append(const_desc)
             self.generic_visit(node)   # still visit body for nested analysis
             return
+        # str(variable) → iterates over O(log₁₀n) characters, not n
+        if self._is_str_iter(node.iter):
+            self.has_str_loop  = True
+            self.has_log_loop  = True
+            self._log_divisor  = 10
+            self._loop_depth  += 1
+            self.max_loop_depth = max(self.max_loop_depth, self._loop_depth)
+            self.generic_visit(node)
+            self._loop_depth  -= 1
+            return
         self._loop_depth += 1
         self.max_loop_depth = max(self.max_loop_depth, self._loop_depth)
         self.generic_visit(node)
         self._loop_depth -= 1
 
-    # ── while-loops + binary-search detection ─────────────────
+    # ── while-loops + logarithmic-reduction detection ─────────
 
     def visit_While(self, node):
         self._loop_depth += 1
         self.max_loop_depth = max(self.max_loop_depth, self._loop_depth)
-        # Binary-search: look for integer-halving inside the loop body
-        #   e.g.  mid = (lo + hi) // 2   or   n >>= 1
+        # Logarithmic pattern: the loop variable is divided / right-shifted
+        # each iteration.  Catches both forms:
+        #   n = n // 2      →  Assign(value=BinOp(op=FloorDiv))
+        #   n //= 10        →  AugAssign(op=FloorDiv, value=Constant(10))
+        #   n >>= 1         →  AugAssign(op=RShift)
+        #   mid = (lo+hi)//2 → BinOp inside Assign
         for child in ast.walk(node):
+            # AugAssign: n //= k  or  n >>= k
+            if isinstance(child, ast.AugAssign) and isinstance(
+                    child.op, (ast.FloorDiv, ast.RShift)):
+                self.has_log_loop = True
+                self.has_binary_search = True
+                if isinstance(child.op, ast.RShift):
+                    # >>= k means divide by 2^k; treat as base-2
+                    self._log_divisor = 2
+                elif isinstance(child.value, ast.Constant) and child.value.value != 0:
+                    self._log_divisor = int(child.value.value)
+                break
+            # BinOp inside any expression: n // 2, (lo+hi) // 2
             if isinstance(child, ast.BinOp) and isinstance(
                     child.op, (ast.FloorDiv, ast.RShift)):
+                self.has_log_loop = True
                 self.has_binary_search = True
+                if isinstance(child.right, ast.Constant) and child.right.value != 0:
+                    self._log_divisor = int(child.right.value)
                 break
         self.generic_visit(node)
         self._loop_depth -= 1
@@ -267,9 +363,18 @@ class ComplexityAnalyzer(ast.NodeVisitor):
             tn += ["Recursive calls always run the same number of times"]
 
         elif self.has_recursion:
-            if self.has_binary_search:
+            if self.has_log_recursion:
                 tc = "O(log n)"
-                tn += ["Recursive halving → divide & conquer"]
+                base = self._log_rec_divisor
+                if base == 2:
+                    tn += ["Recursive call passes n//2 (or n>>k)  \u2192  O(log\u2082n) depth"]
+                elif base == 10:
+                    tn += ["Recursive call passes n//10  \u2192  O(log\u2081\u2080n) depth"]
+                else:
+                    tn += [f"Recursive call passes n//{base}  \u2192  O(log n) depth"]
+            elif self.has_binary_search:
+                tc = "O(log n)"
+                tn += ["Recursive halving \u2192 divide & conquer"]
             elif self.max_loop_depth == 0:
                 tc = "O(n)"
                 tn += ["Linear recursion (single path, no branching)"]
@@ -284,17 +389,35 @@ class ComplexityAnalyzer(ast.NodeVisitor):
                 tn += [f"Sort called inside {self.max_loop_depth} loop(s)"]
 
         elif self.max_loop_depth == 0:
-            tc = "O(1)"
-            if self.constant_loops:
+            if self.has_str_conv:
+                tc = "O(log n)"
+                tn += ["str(n) operates on O(log\u2081\u2080n) digits  \u2192  O(log\u2081\u2080n) time"]
+                if self.has_implicit_iter:
+                    tn += ["Built-in calls (.reverse, .join, list\u2026) also operate on digit-length data"]
+            elif self.has_implicit_iter:
+                tc = "O(n)"
+                tn += ["Built-in operations iterate over input  \u2192  linear time"]
+            elif self.constant_loops:
+                tc = "O(1)"
                 descs = ", ".join(self.constant_loops)
-                tn += [f"Loop(s) over fixed range ({descs})  →  constant time"]
+                tn += [f"Loop(s) over fixed range ({descs})  \u2192  constant time"]
             else:
+                tc = "O(1)"
                 tn += ["No loops or recursion  →  constant time"]
 
         elif self.max_loop_depth == 1:
-            if self.has_binary_search:
+            if self.has_log_loop:
                 tc = "O(log n)"
-                tn += ["Halving pattern in loop  →  binary search"]
+                if self.has_str_loop:
+                    tn += ["Loop iterates over str(n)  →  O(log\u2081\u2080n) digits"]
+                else:
+                    base = self._log_divisor
+                    if base == 2:
+                        tn += ["Loop halves the input each iteration  →  O(log\u2082n)"]
+                    elif base == 10:
+                        tn += ["Loop divides input by 10 each iteration  →  O(log\u2081\u2080n)"]
+                    else:
+                        tn += [f"Loop divides input by {base} each iteration  →  O(log n)"]
             else:
                 tc = "O(n)"
                 tn += ["Single loop  →  linear time"]
@@ -321,6 +444,11 @@ class ComplexityAnalyzer(ast.NodeVisitor):
         if self.has_recursion and self.constant_recursion:
             sc = "O(1)"
             sn += ["Call stack depth is fixed by a constant  \u2192  constant space"]
+        elif self.has_recursion and self.has_log_recursion:
+            sc = "O(log n)"
+            base = self._log_rec_divisor
+            label = f"log\u2081\u2080n" if base == 10 else (f"log\u2082n" if base == 2 else "log n")
+            sn += [f"Recursive call stack shrinks by factor {base}  \u2192  O({label}) depth"]
         elif self.has_recursion:
             sc = "O(n)"
             sn += ["Recursive call stack  →  O(n) depth"]
@@ -328,6 +456,9 @@ class ComplexityAnalyzer(ast.NodeVisitor):
             sc = "O(n)"
             ds_str = ", ".join(sorted(set(self._ds_used)))
             sn += [f"Dynamic structure(s) allocated: {ds_str}"]
+        elif self.has_str_loop or self.has_str_conv:
+            sc = "O(log n)"
+            sn += ["str(n) allocates O(log\u2081\u2080n) characters  \u2192  O(log n) space"]
         else:
             sc = "O(1)"
             sn += ["Only scalar / fixed-size variables  →  constant space"]
@@ -444,8 +575,9 @@ def build_complexity_html(
     runtime_ms: float,
     peak_kb: float,
     has_input: bool = False,
+    show_code: bool = False,
 ) -> str:
-    """Return a full HTML string with code on the left and analysis on the right."""
+    """Return a full HTML string with optional code panel on the left and analysis on the right."""
 
     tc  = analysis.get("time",  "?")
     sc  = analysis.get("space", "?")
@@ -509,14 +641,19 @@ def build_complexity_html(
         </table>
         """
 
-    return f"""
-{_CSS}
-<div class="cr-wrap">
+    left_panel = ""
+    if show_code:
+        left_panel = f"""
   <div class="cr-left">
     <div class="cr-section">Code</div>
     <pre class="cr-code">{code_html}</pre>
-  </div>
-  <div class="cr-right">
+  </div>"""
+
+    return f"""
+{_CSS}
+<div class="cr-wrap">
+  {left_panel}
+  <div class="cr-right" style="{'border-radius:10px' if not show_code else ''}">
     {right_body}
   </div>
 </div>
@@ -570,7 +707,10 @@ def _post_run(_result):
 
     has_input = "input(" in src
     analysis  = ComplexityAnalyzer().analyze(src)
-    html      = build_complexity_html(src, analysis, elapsed_ms, peak_kb, has_input)
+    html      = build_complexity_html(
+        src, analysis, elapsed_ms, peak_kb, has_input,
+        show_code=_state.get("show_code", False),
+    )
     display(HTML(html))
 
 
@@ -578,28 +718,44 @@ def _post_run(_result):
 #  5.  Public API
 # ════════════════════════════════════════════════════════════
 
-def setup_complexity_runner() -> None:
+def setup_complexity_runner(show_code: bool = False) -> None:
     """
     Register the auto-analyze hooks on the current IPython kernel.
     Call this ONCE at the top of your notebook.
+
+    Parameters
+    ----------
+    show_code : bool
+        If True, display the cell's source code alongside the analysis panel.
+        Default is False (analysis panel only).
     """
     ip = get_ipython()
     if ip is None:
         print("⚠  Not running inside IPython/Jupyter – nothing registered.")
         return
 
-    # Safe re-registration (removes stale hooks first)
-    for fn, event in [
-        (_pre_run,  "pre_run_cell"),
-        (_post_run, "post_run_cell"),
-    ]:
-        try:
-            ip.events.unregister(event, fn)
-        except ValueError:
-            pass
-        ip.events.register(event, fn)
+    _state["show_code"] = show_code
 
+    # ── Remove ALL previously registered CR hooks ──────────────
+    # Handles module reloads where old function references differ
+    for event_name in ("pre_run_cell", "post_run_cell"):
+        old_cbs = [cb for cb in ip.events.callbacks.get(event_name, [])
+                   if getattr(cb, '_cr_hook', False)]
+        for cb in old_cbs:
+            try:
+                ip.events.unregister(event_name, cb)
+            except ValueError:
+                pass
+
+    # ── Mark and register fresh hooks ──────────────────────────
+    _pre_run._cr_hook  = True
+    _post_run._cr_hook = True
+    ip.events.register("pre_run_cell",  _pre_run)
+    ip.events.register("post_run_cell", _post_run)
+
+    code_mode = "with code" if show_code else "analysis only (no code panel)"
     print("✅  Complexity Runner is now active!")
+    print(f"    ├─ Mode: {code_mode}")
     print("    ├─ Every cell will show Time & Space complexity after it runs.")
     print("    └─ Add  # NO_ANALYZE  as the first line of any cell to skip it.\n")
 
@@ -608,12 +764,12 @@ def teardown_complexity_runner() -> None:
     """Remove the complexity-analysis hooks (disable auto-analyze)."""
     ip = get_ipython()
     if ip:
-        for fn, event in [
-            (_pre_run,  "pre_run_cell"),
-            (_post_run, "post_run_cell"),
-        ]:
-            try:
-                ip.events.unregister(event, fn)
-            except ValueError:
-                pass
+        for event_name in ("pre_run_cell", "post_run_cell"):
+            old_cbs = [cb for cb in ip.events.callbacks.get(event_name, [])
+                       if getattr(cb, '_cr_hook', False)]
+            for cb in old_cbs:
+                try:
+                    ip.events.unregister(event_name, cb)
+                except ValueError:
+                    pass
     print("Complexity Runner disabled.")
