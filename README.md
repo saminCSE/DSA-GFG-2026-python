@@ -8,8 +8,8 @@ built alongside [GeeksforGeeks](https://www.geeksforgeeks.org/), with built-in c
 ![Python](https://img.shields.io/badge/Python-3.14-blue?style=flat-square&logo=python&logoColor=white)
 ![Jupyter](https://img.shields.io/badge/Jupyter-Notebook-orange?style=flat-square&logo=jupyter&logoColor=white)
 ![GFG](https://img.shields.io/badge/GeeksforGeeks-2026-2F8D46?style=flat-square&logo=geeksforgeeks&logoColor=white)
-![Problems](https://img.shields.io/badge/Problems-10-blueviolet?style=flat-square)
-![Approaches](https://img.shields.io/badge/Approaches-25-green?style=flat-square)
+![Problems](https://img.shields.io/badge/Problems-11-blueviolet?style=flat-square)
+![Approaches](https://img.shields.io/badge/Approaches-27-green?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square)
 
 </div>
@@ -50,10 +50,11 @@ dsa-gfg-2026/
 │   │
 │   └── 02_Easy_Problems/                    # Easy-level problems
 │       ├── 01_Sum_of_Digits.ipynb           #   3 approaches
-│       └── 02_Reverse_Digits.ipynb          #   3 approaches
+│       ├── 02_Reverse_Digits.ipynb          #   3 approaches
+│       └── 03_Prime_Testing.ipynb           #   3 approaches
 │
 ├── utils/                                   # Shared tooling
-│   ├── complexity_runner.py                 #   AST analyzer + runtime profiler (776 lines)
+│   ├── complexity_runner.py                 #   AST analyzer + runtime profiler (829 lines)
 │   └── __init__.py
 │
 ├── cr.py                                    # One-line loader for the complexity runner
@@ -157,12 +158,13 @@ Setup Cell (import cr)
 | 07 | **Dice Problem (Opposite Face)** | if-else mapping, **Arithmetic (`7 − n`)** | **O(1) Time · O(1) Space** |
 | 08 | **Nth Term of AP** | Loop O(n), **Direct formula `a₁ + (n−1)d`** | **O(1) Time · O(1) Space** |
 
-#### 02 · Easy Problems — 2 problems, 6 approaches
+#### 02 · Easy Problems — 3 problems, 9 approaches
 
 | # | Problem | Approaches | Best Complexity |
 |---|---------|-----------|-----------------|
 | 01 | **Sum of Digits** | Iterative mod/div, Recursion (`n//10`), String conversion (`for c in str(n)`) | **O(log n) Time · O(1) Space** |
 | 02 | **Reverse Digits** | Iterative mod/div, Recursion (call-stack unwind), String slicing (`str(n)[::-1]`) | **O(log n) Time · O(1) Space** |
+| 03 | **Prime Testing** | School method (`2…n−1`), Optimized (`2…√n`), **6k ± 1 optimization** | **O(√n) Time · O(1) Space** |
 
 > **Note — Sum of Digits:** No O(1) general solution exists; every digit must be visited, so O(log₁₀n) is the theoretical lower bound. The Digital Root formula (`1 + (n−1) % 9`) runs in O(1) but solves a *different* problem — repeatedly summing digits down to a single digit.
 
@@ -173,14 +175,14 @@ Setup Cell (import cr)
 | Section | Problems | Approaches | Status |
 |---------|----------|-----------|--------|
 | 01 · Basic Problems | 8 | 18 | ✅ Complete |
-| 02 · Easy Problems | 2 | 6 | ✅ Complete |
-| **Total** | **10** | **24** | 🟢 |
+| 02 · Easy Problems | 3 | 9 | ✅ Complete |
+| **Total** | **11** | **27** | 🟢 |
 
 ---
 
 ## 🛠️ Complexity Runner — `utils/complexity_runner.py`
 
-A custom IPython extension (776 lines) that performs **static AST analysis** on every cell execution. Zero external dependencies beyond IPython.
+A custom IPython extension (829 lines) that performs **static AST analysis** on every cell execution. Zero external dependencies beyond IPython.
 
 ### How It Works
 
@@ -281,6 +283,6 @@ Problem statements belong to their respective owners at [GeeksforGeeks](https://
 
 <div align="center">
 
-Made with ❤️ for consistent DSA practice · **10 problems · 24 approaches** · Updated February 2026
+Made with ❤️ for consistent DSA practice · **11 problems · 27 approaches** · Updated February 2026
 
 </div>

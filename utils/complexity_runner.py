@@ -58,6 +58,7 @@ class ComplexityAnalyzer(ast.NodeVisitor):
         self.has_str_loop       = False  # True when loop iterates over str(variable)
         self.has_str_conv       = False  # True when str(variable) is called standalone (no loop)
         self.has_implicit_iter  = False  # True when built-in/method iterates (sum, max, .reverse, .join …)
+        self.has_sqrt_loop      = False  # True when loop bound involves sqrt(n) or n**0.5
 
     # ── collect function definitions + true self-recursion ─────
 
@@ -224,6 +225,46 @@ class ComplexityAnalyzer(ast.NodeVisitor):
             and not all(isinstance(a, ast.Constant) for a in iter_node.args)
         )
 
+    @staticmethod
+    def _is_sqrt_range(iter_node) -> bool:
+        """
+        Returns True when iter_node is  range(..., f(sqrt(n)), ...)  — i.e.
+        the loop runs O(\u221an) times.
+        Detects:
+          range(2, int(math.sqrt(n)) + 1)
+          range(2, int(n**0.5) + 1)
+          range(int(math.sqrt(n)))
+          range(isqrt(n))
+          range(2, isqrt(n) + 1)
+        """
+        if not (
+            isinstance(iter_node, ast.Call)
+            and isinstance(iter_node.func, ast.Name)
+            and iter_node.func.id == "range"
+        ):
+            return False
+        # Walk all range arguments looking for sqrt patterns
+        for arg in iter_node.args:
+            for node in ast.walk(arg):
+                # math.sqrt(x)  or  sqrt(x)
+                if isinstance(node, ast.Call):
+                    func = node.func
+                    if isinstance(func, ast.Attribute) and func.attr == "sqrt":
+                        return True
+                    if isinstance(func, ast.Name) and func.id in ("sqrt", "isqrt"):
+                        return True
+                # n ** 0.5  or  n ** (1/2)
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+                    r = node.right
+                    if isinstance(r, ast.Constant) and r.value == 0.5:
+                        return True
+                    # (1/2) as BinOp
+                    if (isinstance(r, ast.BinOp) and isinstance(r.op, ast.Div)
+                            and isinstance(r.left, ast.Constant) and r.left.value == 1
+                            and isinstance(r.right, ast.Constant) and r.right.value == 2):
+                        return True
+        return False
+
     def visit_For(self, node):
         const_desc = self._is_constant_iter(node.iter)
         if const_desc:
@@ -236,6 +277,14 @@ class ComplexityAnalyzer(ast.NodeVisitor):
             self.has_str_loop  = True
             self.has_log_loop  = True
             self._log_divisor  = 10
+            self._loop_depth  += 1
+            self.max_loop_depth = max(self.max_loop_depth, self._loop_depth)
+            self.generic_visit(node)
+            self._loop_depth  -= 1
+            return
+        # range(..., sqrt(n), ...) → iterates O(√n) times
+        if self._is_sqrt_range(node.iter):
+            self.has_sqrt_loop = True
             self._loop_depth  += 1
             self.max_loop_depth = max(self.max_loop_depth, self._loop_depth)
             self.generic_visit(node)
@@ -406,7 +455,10 @@ class ComplexityAnalyzer(ast.NodeVisitor):
                 tn += ["No loops or recursion  →  constant time"]
 
         elif self.max_loop_depth == 1:
-            if self.has_log_loop:
+            if self.has_sqrt_loop:
+                tc = "O(\u221an)"
+                tn += ["Loop runs up to \u221an iterations (sqrt-bounded range)"]
+            elif self.has_log_loop:
                 tc = "O(log n)"
                 if self.has_str_loop:
                     tn += ["Loop iterates over str(n)  →  O(log\u2081\u2080n) digits"]
@@ -480,8 +532,10 @@ class ComplexityAnalyzer(ast.NodeVisitor):
 _PALETTE = {
     "O(1)":       ("#22c55e", "#052e16"),   # green  – best
     "O(log n)":   ("#84cc16", "#1a2e05"),   # lime
+    "O(\u221an)":     ("#06b6d4", "#083344"),   # cyan   – sqrt
     "O(n)":       ("#3b82f6", "#0c1a3d"),   # blue
     "O(n log n)": ("#f59e0b", "#3d2200"),   # amber
+    "O(n\u221an)":    ("#e879f9", "#3b0764"),   # fuchsia
     "O(n²)":      ("#f97316", "#3d1500"),   # orange
     "O(n³)":      ("#ef4444", "#3d0c0c"),   # red    – worst common
 }
